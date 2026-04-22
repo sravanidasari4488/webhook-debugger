@@ -1,0 +1,23 @@
+# Maven
+target/
+*.class
+*.jar
+
+# Application properties with secrets
+src/main/resources/application.properties
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Node modules (frontend)
+node_modules/
+
+# Environment files
+.env
+*.env
+
+# OS files
+.DS_Store
+Thumbs.db
