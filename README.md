@@ -1,7 +1,7 @@
 Webhook Debugger
 A full-stack developer tool for capturing, inspecting, and replaying HTTP webhook requests in real time.
 Built with React + Vite on the frontend and Spring Boot (Java 17) on the backend, with WebSockets for live streaming, PostgreSQL for persistence, and Redis for caching.
-🔗 Live Demo: webhook-debugger.vercel.app <!-- update with your actual URL -->
+🔗 Live Demo: https://webhook-debugger-frontend.vercel.app/
 
 Features
 
