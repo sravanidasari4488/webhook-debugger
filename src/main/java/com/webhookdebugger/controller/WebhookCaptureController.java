@@ -97,6 +97,8 @@ public class WebhookCaptureController {
 
         WebhookRequest savedRequest = webhookRequestRepository.save(webhookRequest);
 
+        sessionService.evictSessionRequestsCache(sessionId);
+
         simpMessagingTemplate.convertAndSend("/topic/requests/" + sessionId, savedRequest);
 
         return ResponseEntity.status(session.getCustomResponseStatus())
