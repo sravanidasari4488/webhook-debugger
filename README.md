@@ -12,10 +12,11 @@ A webhook request flows through the backend as follows:
 
 1. **Ingestion** — An external sender hits `/{hook}/{sessionId}` (mapped as `/hook/{sessionId}`). `WebhookCaptureController` validates that the session exists and has not expired, then reads the HTTP method, headers, body, query parameters, and source IP.
 2. **Persistence** — The request is serialized (headers and query params to JSON strings) and saved as a `WebhookRequest` row in PostgreSQL via `WebhookRequestRepository`.
-3. **Broadcast** — After save, `SimpMessagingTemplate.convertAndSend` publishes the saved entity to `/topic/requests/{sessionId}`.
-4. **Mock response** — The controller returns an HTTP response using the session's `customResponseStatus` and `customResponseBody` (not per-request overrides).
+3. **Cache invalidation** — The `sessionRequests` Redis cache entry for that session is evicted so the next list read reflects the new request.
+4. **Broadcast** — After save, `SimpMessagingTemplate.convertAndSend` publishes the saved entity to `/topic/requests/{sessionId}`.
+5. **Mock response** — The controller returns an HTTP response using the session's `customResponseStatus` and `customResponseBody` (not per-request overrides).
 
-Redis is listed as a dependency and configured in `application.properties`, but **no application code reads from or writes to Redis** (see [Caching Strategy](#caching-strategy)).
+Read-heavy lookups (`SessionService.getSession`, `SessionService.getAllRequestsForSession`) are served from Redis when cached (see [Caching Strategy](#caching-strategy)).
 
 ```mermaid
 sequenceDiagram
@@ -94,23 +95,51 @@ There are **no JPA relationship mappings** (`@ManyToOne`, `@OneToMany`, etc.). `
 
 ## Caching Strategy
 
-**Redis is not used for caching in the current implementation.**
+Caching is enabled via `@EnableCaching` on `WebhookDebuggerApplication` and a `RedisCacheManager` bean in `RedisConfig`. Values are serialized to Redis as JSON using `GenericJackson2JsonRedisSerializer` with `JavaTimeModule` registered on the `ObjectMapper` so `LocalDateTime` fields deserialize correctly.
 
-Evidence from the codebase:
+The capture endpoint (`/hook/{sessionId}`) is **not** cached — it always writes fresh data to PostgreSQL. Only read-heavy lookups are cached.
 
-- `spring-boot-starter-data-redis` is on the classpath (`pom.xml`).
-- `spring.data.redis.url` is set in `application.properties`.
-- There is no `RedisTemplate`, `StringRedisTemplate`, `@Cacheable`, `@CacheEvict`, or any other Redis access in Java source.
+### What is cached
 
-Therefore:
+| Cache name | Method | Backing query | TTL |
+|---|---|---|---|
+| `sessions` | `SessionService.getSession(sessionId)` | `WebhookSessionRepository.findById` | **60 seconds** (default cache config) |
+| `sessionRequests` | `SessionService.getAllRequestsForSession(sessionId)` | `WebhookRequestRepository.findAllBySessionIdOrderByReceivedAtDesc` | **15 seconds** (dedicated cache config) |
 
-| Aspect | Status |
-|---|---|
-| What is cached | Nothing — all session and request reads go to PostgreSQL via Spring Data JPA |
-| Cache key structure | N/A |
-| TTL / eviction / invalidation | N/A — no cache layer is implemented |
+`getSession` is used by the capture flow, `GET /api/sessions/{sessionId}`, and as a guard before other session APIs. `getAllRequestsForSession` backs `GET /api/sessions/{sessionId}/requests`.
 
-At startup, Spring Boot may still auto-configure a Redis connection from `spring.data.redis.url`, but no application logic consumes it.
+### Cache key structure
+
+Spring Data Redis builds keys as `{cacheName}::{sessionId}`, for example:
+
+- `sessions::550e8400-e29b-41d4-a716-446655440000`
+- `sessionRequests::550e8400-e29b-41d4-a716-446655440000`
+
+The SpEL key expression on each annotation is `#sessionId` (the method's `UUID` parameter).
+
+### Eviction / invalidation
+
+| Trigger | Cache evicted | Mechanism |
+|---|---|---|
+| `PUT /api/sessions/{sessionId}/mock-response` | `sessions` | `@CacheEvict` on `SessionService.updateMockResponse` |
+| New webhook saved at `/hook/{sessionId}` | `sessionRequests` | `SessionService.evictSessionRequestsCache` called from `WebhookCaptureController` after save |
+| `DELETE /api/sessions/{sessionId}/requests` | `sessionRequests` | `@CacheEvict` on `SessionService.clearRequestsForSession` |
+
+There is no explicit eviction of `sessions` when requests are cleared — the session entity itself does not change, only its request rows.
+
+Otherwise, entries expire automatically via TTL (60s for sessions, 15s for request lists).
+
+#### Miss / not-found behavior
+
+`SessionNotFoundException` is **not** cached. This follows from three facts in the current code:
+
+1. **`getSession` never returns `null`** — it uses `orElseThrow(() -> new SessionNotFoundException(sessionId))`, so a missing session always throws rather than returning a value that could be stored.
+2. **Spring `@Cacheable` only stores successful return values** — if the method throws, `CacheInterceptor` does not call `cache.put()`; nothing is written for that key.
+3. **Call-site exception handling does not change that** — `WebhookCaptureController` catches `SessionNotFoundException` and returns HTTP 404, but the catch is in the controller *after* the proxied `getSession` invocation has already failed; the cache layer never saw a return value to store. All other callers (`SessionController`, `GlobalExceptionHandler`) let the exception propagate the same way.
+
+`RedisCacheConfiguration.defaultCacheConfig()` (used in `RedisConfig`) also calls `disableCachingNullValues()` by default, so even a hypothetical `null` return would not be cached.
+
+**Stale hit (different from not-found):** An *existing* session row can remain in the `sessions` cache for up to 60 seconds after `updateMockResponse` evicts it, or until TTL, whichever comes first. Expiration is not cached as a boolean — `isSessionExpired()` is always evaluated against `LocalDateTime.now()` on the returned `WebhookSession`, so capture and `GET /api/sessions/{sessionId}` still reject or flag expired sessions correctly even when the entity comes from Redis.
 
 ---
 
@@ -211,7 +240,7 @@ Pulled from `pom.xml` (Spring Boot parent **3.2.0**, Java **17**):
 | HTTP / REST | `spring-boot-starter-web` |
 | WebSocket / STOMP | `spring-boot-starter-websocket` |
 | Persistence | `spring-boot-starter-data-jpa`, Hibernate (via starter), PostgreSQL JDBC driver |
-| Cache dependency (unused in code) | `spring-boot-starter-data-redis` |
+| Cache | `spring-boot-starter-data-redis`, Spring Cache (`@Cacheable` / `@CacheEvict` via `RedisConfig`) |
 | JSON | Jackson (`ObjectMapper`, via `spring-boot-starter-web`) |
 | HTTP client (replay) | `java.net.http.HttpClient` (JDK) |
 | Boilerplate | Lombok |
@@ -230,7 +259,7 @@ Pulled from `pom.xml` (Spring Boot parent **3.2.0**, Java **17**):
 - Java 17
 - Maven (or use included `./mvnw`)
 - PostgreSQL
-- Redis URL (configured but not used by application logic — still required for Spring Redis auto-configuration unless disabled)
+- Redis (required — backs the `RedisCacheManager` used for session and request-list caching)
 
 ### Configuration
 
@@ -304,6 +333,7 @@ webhook_debugger/
     │   ├── WebhookDebuggerApplication.java
     │   ├── config/
     │   │   ├── CorsConfig.java
+    │   │   ├── RedisConfig.java
     │   │   └── WebSocketConfig.java
     │   ├── controller/
     │   │   ├── HealthController.java
