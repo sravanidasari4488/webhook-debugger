@@ -6,6 +6,8 @@ import com.webhookdebugger.model.WebhookSession;
 import com.webhookdebugger.repository.WebhookRequestRepository;
 import com.webhookdebugger.repository.WebhookSessionRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -29,6 +31,7 @@ public class SessionService {
         return webhookSessionRepository.save(session);
     }
 
+    @Cacheable(value = "sessions", key = "#sessionId")
     public WebhookSession getSession(UUID sessionId) {
         return webhookSessionRepository.findById(sessionId)
                 .orElseThrow(() -> new SessionNotFoundException(sessionId));
@@ -38,14 +41,21 @@ public class SessionService {
         return LocalDateTime.now().isAfter(session.getExpiresAt());
     }
 
+    @Cacheable(value = "sessionRequests", key = "#sessionId")
     public List<WebhookRequest> getAllRequestsForSession(UUID sessionId) {
         return webhookRequestRepository.findAllBySessionIdOrderByReceivedAtDesc(sessionId);
     }
 
+    @CacheEvict(value = "sessionRequests", key = "#sessionId")
     public void clearRequestsForSession(UUID sessionId) {
         webhookRequestRepository.deleteAllBySessionId(sessionId);
     }
 
+    @CacheEvict(value = "sessionRequests", key = "#sessionId")
+    public void evictSessionRequestsCache(UUID sessionId) {
+    }
+
+    @CacheEvict(value = "sessions", key = "#sessionId")
     public WebhookSession updateMockResponse(UUID sessionId, Integer statusCode, String responseBody) {
         WebhookSession session = getSession(sessionId);
         session.setCustomResponseStatus(statusCode);
